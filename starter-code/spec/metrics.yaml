@@ -1,0 +1,125 @@
+# metrics.yaml
+# Single source of truth for every business metric: formula, grain, dependency
+# chain, and the data-quality rules that validate it. Referenced by the
+# pipeline (src/generator.py), the pytest suite (tests/), and the NL query
+# agent (agent/tools.py: get_metric_spec). See
+# .claude/skills/metric_definition_style/SKILL.md for authoring conventions.
+#
+# Provenance note (Task 3 requirement): an AI agent drafted v0 of this file
+# from the Silver schema. new_mrr and churned_mrr were hand re-derived and
+# corrected -- the AI draft defined "new_mrr" as simply "mrr where prior_mrr
+# is null", which double-counts a customer who churned and returned on a
+# different plan_tier as "new" revenue without ever recognizing the churn in
+# the month they left. See logs/ai_interaction_log.md for the full correction.
+
+version: 1
+
+grain: [customer_id, plan_tier, billing_month]
+
+non_identifiability:
+  minimum_group_size: 5
+  # Any query result (via the NL agent or an ad hoc report) that would group
+  # or filter down to fewer than this many distinct customer_id values must
+  # be blocked, not merely flagged. Enforced in code by agent/governance.py.
+
+metrics:
+  mrr:
+    description: Monthly recurring revenue for a customer on a plan tier in a billing month.
+    formula: "SUM(amount_usd)"
+    grain: [customer_id, plan_tier, billing_month]
+    depends_on: []
+    data_type: decimal(12,2)
+
+  prior_mrr:
+    description: The same customer's MRR in the immediately preceding billing_month, on any plan tier.
+    formula: "LAG(mrr, 1) OVER (PARTITION BY customer_id ORDER BY billing_month)"
+    grain: [customer_id, billing_month]
+    depends_on: [mrr]
+    data_type: decimal(12,2)
+    notes: >
+      NULL prior_mrr means no invoice in the prior month, which can mean
+      "new customer" OR "returning after churn" -- disambiguated by new_mrr
+      vs. churned_mrr below, not inferred from NULL alone.
+
+  new_mrr:
+    description: MRR recognized in a month from a customer_id with no MRR in any prior month (first-ever revenue).
+    formula: "CASE WHEN prior_mrr IS NULL AND is_first_billing_month THEN mrr ELSE 0 END"
+    grain: [customer_id, plan_tier, billing_month]
+    depends_on: [mrr, prior_mrr]
+    data_type: decimal(12,2)
+    correction_log: >
+      AI draft used "prior_mrr IS NULL" alone; corrected to also require
+      is_first_billing_month so a win-back (a customer who churned and later
+      returns) is not misclassified as "new" -- it is handled by the
+      win-back branch implicit in net_mrr_change reconciliation instead.
+
+  expansion_mrr:
+    description: Increase in MRR for an existing customer who was already billing in the prior month (upgrade).
+    formula: "CASE WHEN prior_mrr IS NOT NULL AND mrr > prior_mrr THEN mrr - prior_mrr ELSE 0 END"
+    grain: [customer_id, plan_tier, billing_month]
+    depends_on: [mrr, prior_mrr]
+    data_type: decimal(12,2)
+
+  contraction_mrr:
+    description: Decrease in MRR for an existing customer who is still billing (downgrade, not full churn).
+    formula: "CASE WHEN prior_mrr IS NOT NULL AND mrr > 0 AND mrr < prior_mrr THEN prior_mrr - mrr ELSE 0 END"
+    grain: [customer_id, plan_tier, billing_month]
+    depends_on: [mrr, prior_mrr]
+    data_type: decimal(12,2)
+
+  churned_mrr:
+    description: MRR lost because a customer who was billing in the prior month has zero/no invoice this month.
+    formula: "CASE WHEN prior_mrr IS NOT NULL AND (mrr IS NULL OR mrr = 0) THEN prior_mrr ELSE 0 END"
+    grain: [customer_id, billing_month]
+    depends_on: [mrr, prior_mrr]
+    data_type: decimal(12,2)
+    correction_log: >
+      AI draft computed churned_mrr only from rows present in the current
+      month's output, which structurally cannot represent a customer with
+      zero rows this month. Corrected to require a right-side anti-join
+      against the prior month's active customers (see generator.py
+      build_churn_frame) so churned customers surface with mrr = 0 rather
+      than being silently absent from the grain.
+
+  net_mrr_change:
+    description: Net change in MRR this month across all customers (waterfall reconciliation check).
+    formula: "new_mrr + expansion_mrr - contraction_mrr - churned_mrr"
+    grain: [billing_month]
+    depends_on: [new_mrr, expansion_mrr, contraction_mrr, churned_mrr]
+    data_type: decimal(12,2)
+
+  logo_churn_rate:
+    description: Fraction of billing customer_ids active in month N-1 that are not active in month N.
+    formula: "COUNT(DISTINCT churned customer_id) / COUNT(DISTINCT prior month active customer_id)"
+    grain: [billing_month]
+    depends_on: [churned_mrr]
+    data_type: decimal(6,4)
+
+  revenue_churn_rate:
+    description: churned_mrr as a fraction of total prior-month MRR.
+    formula: "SUM(churned_mrr) / SUM(prior_mrr)"
+    grain: [billing_month]
+    depends_on: [churned_mrr, prior_mrr]
+    data_type: decimal(6,4)
+
+data_quality_checks:
+  grain_uniqueness:
+    description: Exactly one gold row per (customer_id, plan_tier, billing_month).
+    check: "COUNT(*) == COUNT(DISTINCT customer_id, plan_tier, billing_month)"
+    severity: fail
+
+  waterfall_reconciliation:
+    description: For every billing_month, mrr(t) == mrr(t-1) + net_mrr_change(t), within $0.01 rounding tolerance.
+    check: "ABS(SUM(mrr WHERE billing_month=t) - (SUM(mrr WHERE billing_month=t-1) + SUM(net_mrr_change WHERE billing_month=t))) <= 0.01"
+    severity: fail
+
+  reconciliation_to_silver:
+    description: SUM(gold.mrr) for a billing_month equals SUM(silver.invoices.amount_usd) for the same month, within tolerance.
+    check: "ABS(SUM(gold.mrr) - SUM(silver.amount_usd)) <= 0.01 * SUM(silver.amount_usd)"
+    tolerance_pct: 1.0
+    severity: fail
+
+  non_identifiability:
+    description: No query grouping may return a group with fewer than non_identifiability.minimum_group_size distinct customer_ids.
+    check: "MIN(COUNT(DISTINCT customer_id) per returned group) >= 5"
+    severity: block
